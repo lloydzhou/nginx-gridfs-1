@@ -4,6 +4,7 @@
 #include <mongoc.h>
 #include <signal.h>
 #include <stdio.h>
+#include <assert.h>
 
 #define TRUE 1
 #define FALSE 0
@@ -28,6 +29,8 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request);
 typedef struct {
     ngx_str_t db;
     ngx_str_t root_collection;
+    ngx_str_t field;
+    ngx_uint_t type;
     ngx_str_t mongo;
 } ngx_http_gridfs_loc_conf_t;
 
@@ -112,7 +115,7 @@ static char * ngx_http_mongo(ngx_conf_t *cf, ngx_command_t *cmd, void *void_conf
 static char* ngx_http_gridfs(ngx_conf_t* cf, ngx_command_t* command, void* void_conf) {
     ngx_http_gridfs_loc_conf_t *gridfs_loc_conf = void_conf;
     ngx_http_core_loc_conf_t* core_conf;
-    ngx_str_t *value;
+    ngx_str_t *value, type;
     volatile ngx_uint_t i;
 
     core_conf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
@@ -123,15 +126,60 @@ static char* ngx_http_gridfs(ngx_conf_t* cf, ngx_command_t* command, void* void_
 
     /* Parse the parameters */
     for (i = 2; i < cf->args->nelts; i++) {
-        if (ngx_strncmp(value[i].data, "root_collection=", 16) == 0) { 
+        if (ngx_strncmp(value[i].data, "root_collection=", 16) == 0) {
             gridfs_loc_conf->root_collection.data = (u_char *) &value[i].data[16];
             gridfs_loc_conf->root_collection.len = ngx_strlen(&value[i].data[16]);
             continue;
         }
+
+        if (ngx_strncmp(value[i].data, "field=", 6) == 0) {
+            gridfs_loc_conf->field.data = (u_char *) &value[i].data[6];
+            gridfs_loc_conf->field.len = ngx_strlen(&value[i].data[6]);
+
+            /* Currently only support for "_id" and "filename" */
+            if (gridfs_loc_conf->field.data != NULL
+                && ngx_strcmp(gridfs_loc_conf->field.data, "filename") != 0
+                && ngx_strcmp(gridfs_loc_conf->field.data, "_id") != 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "Unsupported Field: %s", gridfs_loc_conf->field.data);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "type=", 5) == 0) {
+            type = (ngx_str_t) ngx_string(&value[i].data[5]);
+
+            /* Currently only support for "objectid", "string", and "int" */
+            if (type.len == 0) {
+                gridfs_loc_conf->type = NGX_CONF_UNSET_UINT;
+            } else if (ngx_strcasecmp(type.data, (u_char *)"objectid") == 0) {
+                gridfs_loc_conf->type = BSON_TYPE_OID;
+            } else if (ngx_strcasecmp(type.data, (u_char *)"string") == 0) {
+                gridfs_loc_conf->type = BSON_TYPE_UTF8;
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "Unsupported Type: %s", (char *)value[i].data);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid parameter \"%V\"", &value[i]);
         return NGX_CONF_ERROR;
     }
+
+    if (gridfs_loc_conf->field.data != NULL
+        && ngx_strcmp(gridfs_loc_conf->field.data, "filename") == 0
+        && gridfs_loc_conf->type != BSON_TYPE_UTF8) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "Field: filename, must be of Type: string");
+        return NGX_CONF_ERROR;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -167,6 +215,9 @@ static void* ngx_http_gridfs_create_loc_conf(ngx_conf_t* directive) {
     gridfs_conf->root_collection.len = 0;
     gridfs_conf->mongo.data = NULL;
     gridfs_conf->mongo.len = 0;
+    gridfs_conf->field.data = NULL;
+    gridfs_conf->field.len = 0;
+    gridfs_conf->type = NGX_CONF_UNSET_UINT;
 
     return gridfs_conf;
 }
@@ -179,6 +230,8 @@ static char* ngx_http_gridfs_merge_loc_conf(ngx_conf_t* cf, void* void_parent, v
 
     ngx_conf_merge_str_value(child->db, parent->db, NULL);
     ngx_conf_merge_str_value(child->root_collection, parent->root_collection, "fs");
+    ngx_conf_merge_str_value(child->field, parent->field, "_id");
+    ngx_conf_merge_uint_value(child->type, parent->type, BSON_TYPE_OID);
     ngx_conf_merge_str_value(child->mongo, parent->mongo, "127.0.0.1:27017");
 
 
@@ -310,6 +363,9 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     ngx_int_t rc = NGX_OK;
     bson_t filter;
     bson_oid_t oid;
+    bson_t *opts;
+
+    opts = BCON_NEW ( "sort", "{", "_id", BCON_INT32 (-1), "}");
 
     gridfs_conf = ngx_http_get_module_loc_conf(request, ngx_http_gridfs_module);
     core_conf = ngx_http_get_module_loc_conf(request, ngx_http_core_module);
@@ -322,7 +378,7 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
                       "Mongo Connection not found: \"%V\"", &gridfs_conf->mongo);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    
+
     // ---------- RETRIEVE KEY ---------- //
 
     location_name = core_conf->name;
@@ -359,12 +415,23 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
         return NGX_HTTP_BAD_REQUEST;
     }
     bson_init(&filter);
-    bson_oid_init_from_string(&oid, (const char*)value);
-    bson_append_oid(&filter, "_id", -1, &oid);
-    gfile = mongoc_gridfs_find_one(gridfs, &filter, &error);
+//    bson_oid_init_from_string(&oid, (const char*)value);
+//    bson_append_oid(&filter, "_id", -1, &oid);
+    switch (gridfs_conf->type) {
+    case  BSON_TYPE_OID:
+//        bson_oid_from_string(&oid, value);
+        bson_oid_init_from_string(&oid, (const char*)value);
+        bson_append_oid(&filter, "_id", -1, &oid);
+//        bson_append_oid(&query, (char*)gridfs_conf->field.data, &oid);
+        break;
+    case BSON_TYPE_UTF8:
+        bson_append_utf8(&filter, (char*)gridfs_conf->field.data, -1,(const char*)value, -1);
+        break;
+    }
+    gfile = mongoc_gridfs_find_one_with_opts(gridfs, &filter, opts, &error);
 
     bson_destroy (&filter);
-
+    bson_destroy (opts);
     if(!gfile){
         return NGX_HTTP_NOT_FOUND;
     }
