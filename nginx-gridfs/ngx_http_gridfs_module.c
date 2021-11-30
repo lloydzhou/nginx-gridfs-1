@@ -26,6 +26,8 @@ static ngx_int_t ngx_http_gridfs_init_worker(ngx_cycle_t* cycle);
 
 static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request);
 
+static void ngx_http_gridfs_post_read(ngx_http_request_t* request);
+
 typedef struct {
     ngx_str_t db;
     ngx_str_t root_collection;
@@ -341,6 +343,138 @@ static int url_decode(char * filename) {
     return 1;
 }
 
+static void ngx_http_gridfs_post_read(ngx_http_request_t* request) {
+    ngx_http_gridfs_loc_conf_t* gridfs_conf;
+    ngx_http_core_loc_conf_t* core_conf;
+    ngx_str_t location_name;
+    ngx_str_t full_uri;
+    u_char* value;
+    ngx_http_mongo_connection_t *mongo_conn;
+    mongoc_gridfs_file_t *gfile = NULL;
+    mongoc_gridfs_file_opt_t opt = {0};
+    mongoc_gridfs_t *gridfs;
+    bson_error_t error;
+    // char* gfile_contenttype;
+    mongoc_stream_t *stream;
+    bson_oid_t oid;
+    // bson_value_t id;
+    ngx_chain_t* in;
+    ngx_chain_t out;
+    ngx_buf_t* buffer;
+    const char *response = "OK";
+    int len;
+    ssize_t size;
+
+    if (!request->request_body || !request->request_body->bufs) {
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    gridfs_conf = ngx_http_get_module_loc_conf(request, ngx_http_gridfs_module);
+    core_conf = ngx_http_get_module_loc_conf(request, ngx_http_core_module);
+
+    // ---------- ENSURE MONGO CONNECTION ---------- //
+
+    mongo_conn = ngx_http_get_mongo_connection( gridfs_conf->mongo );
+    if (mongo_conn == NULL) {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                      "Mongo Connection not found: \"%V\"", &gridfs_conf->mongo);
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    // ---------- RETRIEVE KEY ---------- //
+
+    location_name = core_conf->name;
+    full_uri = request->uri;
+
+    if (full_uri.len < location_name.len) {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                      "Invalid location name or uri.");
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    value = ngx_pcalloc(request->pool,sizeof(char) * (full_uri.len - location_name.len + 1));
+    if (value == NULL) {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                      "Failed to allocate memory for value buffer.");
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    memcpy(value, full_uri.data + location_name.len, full_uri.len - location_name.len);
+    value[full_uri.len - location_name.len] = '\0';
+
+    if (!url_decode((char*)value)) {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                      "Malformed request.");
+        ngx_http_finalize_request(request, NGX_HTTP_BAD_REQUEST);
+    }
+
+    // ---------- RETRIEVE GRIDFILE ---------- //
+    gridfs = mongoc_client_get_gridfs(mongo_conn->conn,
+    				(const char*)gridfs_conf->db.data,
+				(const char*)gridfs_conf->root_collection.data,
+				&error);
+    if (!gridfs) {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                      "cannot access gridfs");
+        ngx_http_finalize_request(request, NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+    gfile = mongoc_gridfs_create_file(gridfs, &opt);
+
+    request->headers_out.status = NGX_HTTP_CREATED;
+    buffer = ngx_create_temp_buf(request->pool, 16);
+    if (buffer == NULL) {
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    buffer->in_file = 0;
+    buffer->memory = 1;
+    buffer->last_buf = buffer->last_in_chain = buffer->flush = 1;
+
+    buffer->last = ngx_copy(buffer->pos, response, 2);;
+    out.buf = buffer;
+    out.next = NULL;
+    request->headers_out.content_length_n = buffer->last - buffer->pos;
+    ngx_http_send_header(request);
+
+    if(!gfile){
+        mongoc_gridfs_destroy(gridfs);
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    // set id or name
+    switch (gridfs_conf->type) {
+    case  BSON_TYPE_OID:
+        bson_oid_init_from_string(&oid, (const char*)value);
+        // mongoc_gridfs_file_set_id(gfile, &oid, &error);
+        break;
+    case BSON_TYPE_UTF8:
+        mongoc_gridfs_file_set_filename(gfile, (const char*)value);
+        break;
+    }
+
+    stream = mongoc_stream_gridfs_new(gfile);
+    assert (stream);
+
+    for (in = request->request_body->bufs; in; in = in->next) {
+        len = ngx_buf_size(in->buf);
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "mongoc_stream_write %d", len);
+        size = mongoc_stream_write(stream, in->buf->pos, len, 500);
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "mongoc_stream_write %d", size);
+    }
+
+    mongoc_gridfs_file_save(gfile);
+    mongoc_stream_destroy(stream);
+    mongoc_gridfs_destroy(gridfs);
+    ngx_http_finalize_request(request, NGX_OK);
+    ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "save gridfs");
+    ngx_http_finalize_request(request, ngx_http_output_filter(request, &out));
+    // ngx_http_finalize_request(request, NGX_OK);
+    return;
+}
+
 static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     ngx_http_gridfs_loc_conf_t* gridfs_conf;
     ngx_http_core_loc_conf_t* core_conf;
@@ -350,7 +484,7 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     ngx_str_t full_uri;
     u_char* value;
     ngx_http_mongo_connection_t *mongo_conn;
-    mongoc_gridfs_file_t *gfile;
+    mongoc_gridfs_file_t *gfile = NULL;
     mongoc_gridfs_t *gridfs;
     bson_error_t error;
     int64_t gfile_length;
@@ -365,7 +499,18 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     bson_oid_t oid;
     bson_t *opts;
 
-    opts = BCON_NEW ( "sort", "{", "_id", BCON_INT32 (-1), "}");
+    if (!(request->method & (NGX_HTTP_GET|NGX_HTTP_HEAD|NGX_HTTP_POST))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    // --------- upload file ---------
+    if (request->method & NGX_HTTP_POST) {
+        rc = ngx_http_read_client_request_body(request, ngx_http_gridfs_post_read);
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rc;
+        }
+        return NGX_DONE;
+    }
 
     gridfs_conf = ngx_http_get_module_loc_conf(request, ngx_http_gridfs_module);
     core_conf = ngx_http_get_module_loc_conf(request, ngx_http_core_module);
@@ -414,25 +559,24 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
                       "cannot access gridfs");
         return NGX_HTTP_BAD_REQUEST;
     }
-    bson_init(&filter);
-//    bson_oid_init_from_string(&oid, (const char*)value);
-//    bson_append_oid(&filter, "_id", -1, &oid);
     switch (gridfs_conf->type) {
     case  BSON_TYPE_OID:
-//        bson_oid_from_string(&oid, value);
+        bson_init(&filter);
         bson_oid_init_from_string(&oid, (const char*)value);
         bson_append_oid(&filter, "_id", -1, &oid);
-//        bson_append_oid(&query, (char*)gridfs_conf->field.data, &oid);
+        opts = BCON_NEW ( "sort", "{", "_id", BCON_INT32 (-1), "}");
+        gfile = mongoc_gridfs_find_one_with_opts(gridfs, &filter, opts, &error);
+        bson_destroy (&filter);
+        bson_destroy (opts);
         break;
     case BSON_TYPE_UTF8:
-        bson_append_utf8(&filter, (char*)gridfs_conf->field.data, -1,(const char*)value, -1);
+        gfile = mongoc_gridfs_find_one_by_filename(gridfs, (const char*)value, &error);
         break;
     }
-    gfile = mongoc_gridfs_find_one_with_opts(gridfs, &filter, opts, &error);
 
-    bson_destroy (&filter);
-    bson_destroy (opts);
     if(!gfile){
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, error.message);
+        mongoc_gridfs_destroy(gridfs);
         return NGX_HTTP_NOT_FOUND;
     }
 
@@ -452,6 +596,13 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
 
     ngx_http_send_header(request);
 
+    // --------- HEAD  ------------//
+    if (request->method & NGX_HTTP_HEAD) {
+        mongoc_gridfs_file_destroy(gfile);
+        mongoc_gridfs_destroy(gridfs);
+        ngx_http_finalize_request(request, NGX_OK);
+        return NGX_OK;
+    }
 
     // ---------- SEND THE BODY ---------- //
     stream = mongoc_stream_gridfs_new (gfile);
@@ -461,6 +612,9 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     		if(gbuffer==NULL){
     			ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
     						  "Failed to allocate response buffer");
+                mongoc_stream_destroy(stream);
+                mongoc_gridfs_file_destroy(gfile);
+                mongoc_gridfs_destroy(gridfs);
     			return NGX_HTTP_INTERNAL_SERVER_ERROR;
     		}
     	    iov.iov_base = (void *) gbuffer;
@@ -475,6 +629,9 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
 		if (buffer == NULL) {
 			ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
 						  "Failed to allocate response buffer");
+            mongoc_stream_destroy(stream);
+            mongoc_gridfs_file_destroy(gfile);
+            mongoc_gridfs_destroy(gridfs);
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 		}
 		buffer->pos = (u_char*)iov.iov_base;
@@ -485,6 +642,9 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
 		out.next = NULL;
         rc = ngx_http_output_filter(request, &out);
         if (rc == NGX_ERROR) {
+            mongoc_stream_destroy(stream);
+            mongoc_gridfs_file_destroy(gfile);
+            mongoc_gridfs_destroy(gridfs);
             return NGX_ERROR;
         }
     }
