@@ -1,5 +1,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <ngx_md5.h>
 #include <ngx_http.h>
 #include <mongoc.h>
 #include <signal.h>
@@ -343,6 +344,19 @@ static int url_decode(char * filename) {
     return 1;
 }
 
+static void ngx_http_gridfs_set_header(ngx_http_request_t* request, char* key, u_char* value) {
+    ngx_table_elt_t *h;
+    h = ngx_list_push(&request->headers_out.headers);
+    if (h == NULL) {
+        return ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
+    h->hash = 1;
+    ngx_str_set(&h->key, key);
+    h->key.len = ngx_strlen(key);
+    ngx_str_set(&h->value, value);
+    h->value.len = ngx_strlen(value);
+    return;
+}
 static void ngx_http_gridfs_post_read(ngx_http_request_t* request) {
     ngx_http_gridfs_loc_conf_t* gridfs_conf;
     ngx_http_core_loc_conf_t* core_conf;
@@ -354,16 +368,20 @@ static void ngx_http_gridfs_post_read(ngx_http_request_t* request) {
     mongoc_gridfs_file_opt_t opt = {0};
     mongoc_gridfs_t *gridfs;
     bson_error_t error;
-    // char* gfile_contenttype;
+    int64_t gfile_length;
     mongoc_stream_t *stream;
     bson_oid_t oid;
-    // bson_value_t id;
+    bson_value_t new_file_id;
+    const bson_value_t *file_id;
     ngx_chain_t* in;
     ngx_chain_t out;
     ngx_buf_t* buffer;
     const char *response = "OK";
     int len;
     ssize_t size;
+    u_char* p;
+    ngx_md5_t     md5;
+    u_char md5_buf[16], md5_buf_hex[32], file_id_buf[25];
 
     if (!request->request_body || !request->request_body->bufs) {
         ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -421,9 +439,90 @@ static void ngx_http_gridfs_post_read(ngx_http_request_t* request) {
         ngx_http_finalize_request(request, NGX_HTTP_BAD_REQUEST);
         return;
     }
+
+    opt.content_type = (const char*)request->headers_in.content_type->value.data;
     gfile = mongoc_gridfs_create_file(gridfs, &opt);
 
+    if(!gfile){
+        mongoc_gridfs_destroy(gridfs);
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    // set id or name
+    switch (gridfs_conf->type) {
+    case  BSON_TYPE_OID:
+        bson_oid_init_from_string(&oid, (const char*)value);
+        new_file_id.value_type = BSON_TYPE_OID;
+        new_file_id.value.v_oid = oid;
+        mongoc_gridfs_file_set_id(gfile, &new_file_id, &error);
+        break;
+    case BSON_TYPE_UTF8:
+        mongoc_gridfs_file_set_filename(gfile, (const char*)value);
+        break;
+    }
+
+    stream = mongoc_stream_gridfs_new(gfile);
+    assert (stream);
+
+    ngx_md5_init(&md5);
+
+    ngx_buf_t *temp_buf;
+    for (in = request->request_body->bufs; in; in = in->next) {
+        len = ngx_buf_size(in->buf);
+        if (in->buf->in_file) {
+            temp_buf = ngx_create_temp_buf(request->pool, len);
+            if (NULL == temp_buf) {
+                return ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+            ssize_t read_n;
+            read_n = ngx_read_file(in->buf->file, temp_buf->start, len, 0);
+            if (read_n < 0) {
+                /* Problem already logged by read_file. */
+                return ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            } else {
+                temp_buf->last = temp_buf->start + read_n;
+            }
+        } else {
+            temp_buf = in->buf;
+        }
+        size = mongoc_stream_write(stream, temp_buf->pos, len, 500);
+	    ngx_md5_update(&md5, temp_buf->pos, len);
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, request->connection->log, 0, "mongoc_stream_write %d %d", size, in->buf->in_file);
+    }
+	ngx_md5_final(md5_buf, &md5);
+    ngx_hex_dump(md5_buf_hex, md5_buf, 16);
+
+    mongoc_gridfs_file_set_md5(gfile, (const char*)md5_buf_hex);
+    mongoc_gridfs_file_save(gfile);
+    // ngx_log_debug(NGX_LOG_DEBUG, request->connection->log, 0, "save gridfs");
+    /* Get information about the file */
+    gfile_length = mongoc_gridfs_file_get_length(gfile);
+    // ngx_log_debug(NGX_LOG_DEBUG_HTTP, request->connection->log, 0, "save_file %O", gfile_length);
+    file_id = mongoc_gridfs_file_get_id(gfile);
+
+    if (file_id == NULL) {
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    bson_oid_to_string((const bson_oid_t*)&file_id->value, (char*)file_id_buf);
+
+    p = ngx_palloc(request->pool, NGX_OFF_T_LEN);
+    if (p == NULL) {
+        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    ngx_sprintf(p, "%d", gfile_length);
+    ngx_http_gridfs_set_header(request, "X-File-Size", p);
+
+    ngx_http_gridfs_set_header(request, "X-File-MD5", md5_buf_hex);
+
+    ngx_http_gridfs_set_header(request, "X-File-Id", file_id_buf);
+
+    // ---------- SEND THE HEADERS ---------- //
     request->headers_out.status = NGX_HTTP_CREATED;
+    ngx_str_t t = ngx_string("text/plain");
+    request->headers_out.content_type = t;
+
     buffer = ngx_create_temp_buf(request->pool, 16);
     if (buffer == NULL) {
         ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -439,39 +538,10 @@ static void ngx_http_gridfs_post_read(ngx_http_request_t* request) {
     request->headers_out.content_length_n = buffer->last - buffer->pos;
     ngx_http_send_header(request);
 
-    if(!gfile){
-        mongoc_gridfs_destroy(gridfs);
-        ngx_http_finalize_request(request, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-    // set id or name
-    switch (gridfs_conf->type) {
-    case  BSON_TYPE_OID:
-        bson_oid_init_from_string(&oid, (const char*)value);
-        // mongoc_gridfs_file_set_id(gfile, &oid, &error);
-        break;
-    case BSON_TYPE_UTF8:
-        mongoc_gridfs_file_set_filename(gfile, (const char*)value);
-        break;
-    }
-
-    stream = mongoc_stream_gridfs_new(gfile);
-    assert (stream);
-
-    for (in = request->request_body->bufs; in; in = in->next) {
-        len = ngx_buf_size(in->buf);
-        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "mongoc_stream_write %d", len);
-        size = mongoc_stream_write(stream, in->buf->pos, len, 500);
-        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "mongoc_stream_write %d", size);
-    }
-
-    mongoc_gridfs_file_save(gfile);
     mongoc_stream_destroy(stream);
     mongoc_gridfs_destroy(gridfs);
-    ngx_http_finalize_request(request, NGX_OK);
-    ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "save gridfs");
+    // ngx_log_debug(NGX_LOG_DEBUG_HTTP, request->connection->log, 0, "save gridfs");
     ngx_http_finalize_request(request, ngx_http_output_filter(request, &out));
-    // ngx_http_finalize_request(request, NGX_OK);
     return;
 }
 
